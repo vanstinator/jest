@@ -17,11 +17,13 @@ import {
   Context as VMContext,
   // @ts-expect-error: experimental, not added to the types
   Module as VMModule,
+  compileFunction,
 } from 'vm';
 import {parse as parseCjs} from 'cjs-module-lexer';
 import {CoverageInstrumenter, V8Coverage} from 'collect-v8-coverage';
 import execa = require('execa');
 import * as fs from 'graceful-fs';
+import {satisfies} from 'semver';
 import slash = require('slash');
 import stripBOM = require('strip-bom');
 import type {
@@ -136,8 +138,6 @@ const getModuleNameMapper = (config: Config.ProjectConfig) => {
 const unmockRegExpCache = new WeakMap();
 
 const EVAL_RESULT_VARIABLE = 'Object.<anonymous>';
-
-type RunScriptEvalResult = {[EVAL_RESULT_VARIABLE]: ModuleWrapper};
 
 const runtimeSupportsVmModules = typeof SyntheticModule === 'function';
 
@@ -1443,18 +1443,55 @@ export default class Runtime {
 
     let compiledFunction: ModuleWrapper | null = null;
 
-    const script = this.createScriptFromCode(transformedCode, filename);
-
-    let runScript: RunScriptEvalResult | null = null;
-
     const vmContext = this._environment.getVmContext();
 
     if (vmContext) {
-      runScript = script.runInContext(vmContext, {filename});
-    }
+      try {
+        if (satisfies(process.versions.node, '>=16.10.0')) {
+          compiledFunction = compileFunction(
+            this.transformFile(filename, options),
+            this.constructInjectedModuleParameters(),
+            {
+              filename,
+              // memory leaks when importModuleDynamically is implemented
+              // @ts-expect-error: Experimental ESM API
+              importModuleDynamically: async (specifier: string) => {
+                const scriptFilename = this._resolver.isCoreModule(filename)
+                  ? `jest-nodejs-core-${filename}`
+                  : filename;
 
-    if (runScript !== null) {
-      compiledFunction = runScript[EVAL_RESULT_VARIABLE];
+                invariant(
+                  runtimeSupportsVmModules,
+                  'You need to run with a version of node that supports ES Modules in the VM API. See https://jestjs.io/docs/ecmascript-modules',
+                );
+
+                const context = this._environment.getVmContext?.();
+
+                invariant(context, 'Test environment has been torn down');
+
+                const module = await this.resolveModule(
+                  specifier,
+                  scriptFilename,
+                  context,
+                );
+
+                return this.linkAndEvaluateModule(module);
+              },
+              parsingContext: vmContext,
+            },
+          ) as ModuleWrapper;
+        } else {
+          const script = this.createScriptFromCode(transformedCode, filename);
+
+          const runScript = script.runInContext(vmContext, {filename});
+
+          if (runScript !== null) {
+            compiledFunction = runScript[EVAL_RESULT_VARIABLE];
+          }
+        }
+      } catch (e: any) {
+        throw handlePotentialSyntaxError(e);
+      }
     }
 
     if (compiledFunction === null) {
